@@ -9,13 +9,11 @@ on:
         type: choice
         options:
           - main
-          - release_beta
       target_branch:
         description: 'Target branch to merge into'
         required: true
         type: choice
         options:
-          - release_beta
           - release
 
 jobs:
@@ -86,23 +84,46 @@ jobs:
           if [ $MERGE_EXIT_CODE -eq 0 ]; then
             echo "✅ Merge completed successfully with no conflicts"
             echo "has_conflicts=false" >> $GITHUB_OUTPUT
+            echo "conflict_files=" >> $GITHUB_OUTPUT
+
+            # Push the successful merge
+            git push origin "$SYNC_BRANCH"
           else
-            echo "⚠️  Merge has conflicts - will push anyway for manual resolution"
+            echo "⚠️  Merge has conflicts in some files"
             echo "has_conflicts=true" >> $GITHUB_OUTPUT
 
-            # Add all files including conflicts
-            git add -A
+            # Get list of conflicted files
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+            echo "Conflicted files:"
+            echo "$CONFLICT_FILES"
+            echo "conflict_files<<EOF" >> $GITHUB_OUTPUT
+            echo "$CONFLICT_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
 
-            # Check if there's anything to commit
+            # Stage files that were successfully merged (no conflicts)
+            # This includes files resolved by .gitattributes
+            git add -u
+
+            # Unstage conflicted files (so they're not committed with conflict markers)
+            for file in $CONFLICT_FILES; do
+              git reset HEAD "$file" 2>/dev/null || true
+            done
+
+            # Check if there are any resolved files to commit
             if git diff --cached --quiet; then
-              echo "No changes to commit after merge attempt"
+              echo "No files were auto-resolved. Aborting merge."
+              git merge --abort
+              git push origin "$SYNC_BRANCH"
             else
-              git commit -m "Merge $SOURCE into $TARGET (with conflicts)" || true
+              echo "Committing auto-resolved files..."
+              git commit -m "Partial merge: auto-resolved files from $SOURCE  Files resolved via .gitattributes merge strategy. Remaining conflicts need manual resolution. Conflicted files: $CONFLICT_FILES"
+
+              # Push the partial merge
+              git push origin "$SYNC_BRANCH"
+
+              echo "✅ Auto-resolved files committed. Conflicts remain for manual resolution."
             fi
           fi
-
-          # Push the sync branch
-          git push origin "$SYNC_BRANCH"
 
       - name: Create Pull Request
         env:
@@ -115,24 +136,45 @@ jobs:
 
           # Create PR body
           if [[ "$HAS_CONFLICTS" == "true" ]]; then
-            PR_BODY="## 🤖 Automated Branch Sync
+            CONFLICT_LIST="${{ steps.merge.outputs.conflict_files }}"
+
+            # Format conflict list
+            CONFLICT_MARKDOWN=""
+            if [ -n "$CONFLICT_LIST" ]; then
+              CONFLICT_MARKDOWN=$(echo "$CONFLICT_LIST" | sed 's/^/- /' | sed 's/$//')
+            fi
+
+            gh pr create \
+              --title "🔄 Sync $SOURCE → $TARGET" \
+              --base "$TARGET" \
+              --head "$SYNC_BRANCH" \
+              --label "auto-sync" \
+              --body "## 🤖 Automated Branch Sync
 
           This PR was automatically created to sync \`$SOURCE\` → \`$TARGET\`.
 
           ⚠️  **This PR has merge conflicts that need manual resolution.**
 
-          ### Files auto-resolved via .gitattributes (merge=ours):
+          ### ✅ Files auto-resolved via .gitattributes (merge=ours):
           - \`build.properties\`
           - \`scripts/kubernetes-brand-adserver-deployment.sh\`
           - \`scripts/kubernetes-brand-adserver-deployment_sysmgmt.sh\`
 
+          ### ❌ Files with conflicts requiring manual resolution:
+          $CONFLICT_MARKDOWN
+
           ### Action Required:
-          Please resolve remaining conflicts using GitHub's web editor or locally.
+          Resolve the conflicted files above using GitHub's web editor or locally.
 
           ---
           *Triggered by: @${{ github.actor }}*"
           else
-            PR_BODY="## 🤖 Automated Branch Sync
+            gh pr create \
+              --title "🔄 Sync $SOURCE → $TARGET" \
+              --base "$TARGET" \
+              --head "$SYNC_BRANCH" \
+              --label "auto-sync" \
+              --body "## 🤖 Automated Branch Sync
 
           This PR was automatically created to sync \`$SOURCE\` → \`$TARGET\`.
 
@@ -146,13 +188,5 @@ jobs:
           ---
           *Triggered by: @${{ github.actor }}*"
           fi
-
-          # Create the PR
-          gh pr create \
-            --title "🔄 Sync $SOURCE → $TARGET" \
-            --body "$PR_BODY" \
-            --base "$TARGET" \
-            --head "$SYNC_BRANCH" \
-            --label "auto-sync"
 
           echo "✅ Pull request created successfully"
