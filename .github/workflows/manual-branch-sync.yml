@@ -100,29 +100,24 @@ jobs:
             echo "$CONFLICT_FILES" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
 
-            # Stage files that were successfully merged (no conflicts)
-            # This includes files resolved by .gitattributes
-            git add -u
-
-            # Unstage conflicted files (so they're not committed with conflict markers)
+            # For conflicted files, accept the source (theirs) version
+            # This ensures all changes from source are included in the PR
             for file in $CONFLICT_FILES; do
-              git reset HEAD "$file" 2>/dev/null || true
+              echo "Resolving $file using source version"
+              git checkout --theirs "$file"
+              git add "$file"
             done
 
-            # Check if there are any resolved files to commit
-            if git diff --cached --quiet; then
-              echo "No files were auto-resolved. Aborting merge."
-              git merge --abort
-              git push origin "$SYNC_BRANCH"
-            else
-              echo "Committing auto-resolved files..."
-              git commit -m "Partial merge: auto-resolved files from $SOURCE  Files resolved via .gitattributes merge strategy. Remaining conflicts need manual resolution. Conflicted files: $CONFLICT_FILES"
+            # Stage all other merged files
+            git add -u
 
-              # Push the partial merge
-              git push origin "$SYNC_BRANCH"
+            # Commit everything
+            git commit -m "Merge $SOURCE into $TARGET Files resolved using source version (manual review recommended): $CONFLICT_FILES"
 
-              echo "✅ Auto-resolved files committed. Conflicts remain for manual resolution."
-            fi
+            # Push the merge
+            git push origin "$SYNC_BRANCH"
+
+            echo "✅ Merge completed. Files with conflicts were resolved using source version."
           fi
 
       - name: Create Pull Request
@@ -153,18 +148,18 @@ jobs:
 
           This PR was automatically created to sync \`$SOURCE\` → \`$TARGET\`.
 
-          ⚠️  **This PR has merge conflicts that need manual resolution.**
+          ⚠️  **Some files had conflicts and were auto-resolved**
 
-          ### ✅ Files auto-resolved via .gitattributes (merge=ours):
+          ### ✅ Files auto-resolved via .gitattributes (kept target version):
           - \`build.properties\`
           - \`scripts/kubernetes-brand-adserver-deployment.sh\`
           - \`scripts/kubernetes-brand-adserver-deployment_sysmgmt.sh\`
 
-          ### ❌ Files with conflicts requiring manual resolution:
+          ### ⚠️  Files auto-resolved using source version (please review):
           $CONFLICT_MARKDOWN
 
           ### Action Required:
-          Resolve the conflicted files above using GitHub's web editor or locally.
+          Review the files listed above to ensure the source version is acceptable. If you need to merge changes from the target branch, edit those files manually.
 
           ---
           *Triggered by: @${{ github.actor }}*"
