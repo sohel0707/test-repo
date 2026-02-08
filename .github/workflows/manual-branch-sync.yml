@@ -1,0 +1,187 @@
+name: Manual Branch Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to merge from'
+        required: true
+        type: choice
+        options:
+          - main
+      target_branch:
+        description: 'Target branch to merge into'
+        required: true
+        type: choice
+        options:
+          - release
+
+jobs:
+  sync-branches:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate branch combination
+        run: |
+          SOURCE="${{ github.event.inputs.source_branch }}"
+          TARGET="${{ github.event.inputs.target_branch }}"
+
+          echo "Source: $SOURCE"
+          echo "Target: $TARGET"
+
+          # Validate allowed combinations
+          if [[ "$SOURCE" == "main" && "$TARGET" != "release" ]]; then
+            echo "❌ ERROR: mainline can only be merged into release_beta"
+            exit 1
+          fi
+
+          if [[ "$SOURCE" == "release_beta" && "$TARGET" != "release" ]]; then
+            echo "❌ ERROR: release_beta can only be merged into release"
+            exit 1
+          fi
+
+          echo "✅ Valid branch combination"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Configure the 'ours' merge driver
+          git config merge.ours.driver true
+
+      - name: Create sync branch and merge
+        id: merge
+        run: |
+          SOURCE="${{ github.event.inputs.source_branch }}"
+          TARGET="${{ github.event.inputs.target_branch }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SYNC_BRANCH="auto-sync-${SOURCE}-to-${TARGET}-${TIMESTAMP}"
+
+          echo "sync_branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+          # Checkout target branch
+          git checkout "$TARGET"
+
+          # Create new sync branch from target
+          git checkout -b "$SYNC_BRANCH"
+
+          # Attempt to merge source into sync branch
+          echo "Attempting to merge $SOURCE into $SYNC_BRANCH (based on $TARGET)..."
+
+          # Try merge, capture exit code
+          set +e
+          git merge "$SOURCE" --no-edit -m "Merge $SOURCE into $TARGET via automated sync"
+          MERGE_EXIT_CODE=$?
+          set -e
+
+          if [ $MERGE_EXIT_CODE -eq 0 ]; then
+            echo "✅ Merge completed successfully with no conflicts"
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+            echo "conflict_files=" >> $GITHUB_OUTPUT
+
+            # Push the successful merge
+            git push origin "$SYNC_BRANCH"
+          else
+            echo "⚠️  Merge has conflicts in some files"
+            echo "has_conflicts=true" >> $GITHUB_OUTPUT
+
+            # Get list of conflicted files
+            CONFLICT_FILES=$(git diff --name-only --diff-filter=U)
+            echo "Conflicted files:"
+            echo "$CONFLICT_FILES"
+            echo "conflict_files<<EOF" >> $GITHUB_OUTPUT
+            echo "$CONFLICT_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+
+            # For conflicted files, accept the source (theirs) version
+            # This ensures all changes from source are included in the PR
+            for file in $CONFLICT_FILES; do
+              echo "Resolving $file using source version"
+              git checkout --theirs "$file"
+              git add "$file"
+            done
+
+            # Stage all other merged files
+            git add -u
+
+            # Commit everything
+            git commit -m "Merge $SOURCE into $TARGET Files resolved using source version (manual review recommended): $CONFLICT_FILES"
+
+            # Push the merge
+            git push origin "$SYNC_BRANCH"
+
+            echo "✅ Merge completed. Files with conflicts were resolved using source version."
+          fi
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SOURCE="${{ github.event.inputs.source_branch }}"
+          TARGET="${{ github.event.inputs.target_branch }}"
+          SYNC_BRANCH="${{ steps.merge.outputs.sync_branch }}"
+          HAS_CONFLICTS="${{ steps.merge.outputs.has_conflicts }}"
+
+          # Create PR body
+          if [[ "$HAS_CONFLICTS" == "true" ]]; then
+            CONFLICT_LIST="${{ steps.merge.outputs.conflict_files }}"
+
+            # Format conflict list
+            CONFLICT_MARKDOWN=""
+            if [ -n "$CONFLICT_LIST" ]; then
+              CONFLICT_MARKDOWN=$(echo "$CONFLICT_LIST" | sed 's/^/- /' | sed 's/$//')
+            fi
+
+            gh pr create \
+              --title "🔄 Sync $SOURCE → $TARGET" \
+              --base "$TARGET" \
+              --head "$SYNC_BRANCH" \
+              --label "auto-sync" \
+              --body "## 🤖 Automated Branch Sync
+
+          This PR was automatically created to sync \`$SOURCE\` → \`$TARGET\`.
+
+          ⚠️  **Some files had conflicts and were auto-resolved**
+
+          ### ✅ Files auto-resolved via .gitattributes (kept target version):
+          - \`build.properties\`
+          - \`scripts/kubernetes-brand-adserver-deployment.sh\`
+          - \`scripts/kubernetes-brand-adserver-deployment_sysmgmt.sh\`
+
+          ### ⚠️  Files auto-resolved using source version (please review):
+          $CONFLICT_MARKDOWN
+
+          ### Action Required:
+          Review the files listed above to ensure the source version is acceptable. If you need to merge changes from the target branch, edit those files manually.
+
+          ---
+          *Triggered by: @${{ github.actor }}*"
+          else
+            gh pr create \
+              --title "🔄 Sync $SOURCE → $TARGET" \
+              --base "$TARGET" \
+              --head "$SYNC_BRANCH" \
+              --label "auto-sync" \
+              --body "## 🤖 Automated Branch Sync
+
+          This PR was automatically created to sync \`$SOURCE\` → \`$TARGET\`.
+
+          ✅ **No conflicts detected** - ready to merge!
+
+          ### Files auto-resolved via .gitattributes (merge=ours):
+          - \`build.properties\`
+          - \`scripts/kubernetes-brand-adserver-deployment.sh\`
+          - \`scripts/kubernetes-brand-adserver-deployment_sysmgmt.sh\`
+
+          ---
+          *Triggered by: @${{ github.actor }}*"
+          fi
+
+          echo "✅ Pull request created successfully"
